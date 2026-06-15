@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
-MIN_RATING         = 3
+MIN_TEMP           = 0     # minimum temperature score (0 = send all airdrops)
 STATE_FILE         = "seen_airdrops.json"
 
 HEADERS = {
@@ -49,13 +49,13 @@ def send_telegram(message):
         print(f"[Telegram error] {e}")
 
 def format_alert(airdrop):
-    stars = "⭐" * airdrop.get("rating", 0)
+    temp  = airdrop.get("temperature", 0)
+    heat  = "🔥" if temp >= 100 else "⭐" if temp >= 50 else "•"
+    confirmed = " CONFIRMED" if airdrop.get("confirmed") else ""
     return (
-        f"🚀 <b>NEW AIRDROP FOUND</b>\n\n"
+        f"🚀 <b>NEW AIRDROP{confirmed}</b>\n\n"
         f"<b>{airdrop['name']}</b>\n"
-        f"Rating : {stars}\n"
-        f"Value  : {airdrop.get('value', '?')}\n"
-        f"Req    : {airdrop.get('requirements', 'See link')}\n"
+        f"Heat   : {heat} {temp}\n"
         f"Source : {airdrop['source']}\n"
         f"Link   : {airdrop['url']}\n\n"
         f"<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC</i>"
@@ -68,27 +68,29 @@ def scrape_airdrops_io():
     try:
         resp = requests.get("https://airdrops.io/", headers=HEADERS, timeout=15)
         soup = BeautifulSoup(resp.text, "html.parser")
-        cards = soup.select("article.airdrop-item, div.airdrop-item, div.coin-airdrop")
-        if not cards:
-            cards = soup.select("div.row div[class*='airdrop']")
+        cards = soup.select("article.airdrop-hover")
+        print(f"  airdrops.io: found {len(cards)} cards")
         for card in cards:
             try:
-                name_tag  = card.select_one("h3, h2, .airdrop-name, .title")
-                link_tag  = card.select_one("a[href]")
-                value_tag = card.select_one(".airdrop-value, .value, [class*='worth']")
-                req_tag   = card.select_one(".airdrop-requirements, .requirements, [class*='req']")
-                stars     = len(card.select(".fa-star, .star.active, [class*='star-filled']"))
+                name_tag = card.select_one("h3, h2, a")
+                link_tag = card.select_one("a[href]")
                 if not name_tag or not link_tag:
                     continue
-                name = name_tag.get_text(strip=True)
-                url  = link_tag["href"]
+                name    = name_tag.get_text(strip=True)
+                url     = link_tag["href"]
                 if not url.startswith("http"):
                     url = "https://airdrops.io" + url
+                classes   = card.get("class", [])
+                temp_cls  = [c for c in classes if c.startswith("temperature-")]
+                temp      = int(temp_cls[0].split("-")[1]) if temp_cls else 0
+                confirmed = "confirmed" in classes
                 results.append({
-                    "id": f"airdroprio_{url}", "name": name, "url": url,
-                    "value": value_tag.get_text(strip=True) if value_tag else "?",
-                    "requirements": req_tag.get_text(strip=True)[:100] if req_tag else "See link",
-                    "rating": min(stars, 5), "source": "airdrops.io",
+                    "id":          f"aio_{url}",
+                    "name":        name,
+                    "url":         url,
+                    "temperature": temp,
+                    "confirmed":   confirmed,
+                    "source":      "airdrops.io",
                 })
             except Exception:
                 continue
@@ -102,24 +104,30 @@ def scrape_airdropalert():
     try:
         resp = requests.get("https://airdropalert.com/", headers=HEADERS, timeout=15)
         soup = BeautifulSoup(resp.text, "html.parser")
-        cards = soup.select("div.airdrop-card, article, div.card")
+        # try multiple selectors
+        cards = soup.select("div.airdrop-item, div.airdrop-card, div.col-md-4, article")
+        seen_links = set()
+        print(f"  airdropalert.com: found {len(cards)} candidate cards")
         for card in cards:
             try:
-                name_tag  = card.select_one("h2, h3, .card-title, .airdrop-title")
-                link_tag  = card.select_one("a[href]")
-                value_tag = card.select_one("[class*='value'], [class*='worth'], .amount")
-                stars     = len(card.select("[class*='star-on'], [class*='active-star'], .fa-star"))
+                name_tag = card.select_one("h2, h3, h4, .card-title")
+                link_tag = card.select_one("a[href]")
                 if not name_tag or not link_tag:
                     continue
                 name = name_tag.get_text(strip=True)
                 url  = link_tag["href"]
                 if not url.startswith("http"):
                     url = "https://airdropalert.com" + url
+                if url in seen_links or len(name) < 2:
+                    continue
+                seen_links.add(url)
                 results.append({
-                    "id": f"airdropalert_{url}", "name": name, "url": url,
-                    "value": value_tag.get_text(strip=True) if value_tag else "?",
-                    "requirements": "See link",
-                    "rating": min(stars, 5), "source": "airdropalert.com",
+                    "id":          f"aa_{url}",
+                    "name":        name,
+                    "url":         url,
+                    "temperature": 50,
+                    "confirmed":   False,
+                    "source":      "airdropalert.com",
                 })
             except Exception:
                 continue
@@ -134,10 +142,11 @@ def scrape_coinmarketcap():
         url  = "https://coinmarketcap.com/airdrop/"
         resp = requests.get(url, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table tbody tr, div[class*='airdrop'] div[class*='row']")
+        rows = soup.select("table tbody tr")
+        print(f"  coinmarketcap: found {len(rows)} rows")
         for row in rows:
             try:
-                name_tag = row.select_one("a, p, span")
+                name_tag = row.select_one("a")
                 link_tag = row.select_one("a[href]")
                 if not name_tag:
                     continue
@@ -148,9 +157,12 @@ def scrape_coinmarketcap():
                 if len(name) < 2:
                     continue
                 results.append({
-                    "id": f"cmc_{href}", "name": name, "url": href,
-                    "value": "See CMC", "requirements": "See link",
-                    "rating": 3, "source": "coinmarketcap.com",
+                    "id":          f"cmc_{href}",
+                    "name":        name,
+                    "url":         href,
+                    "temperature": 50,
+                    "confirmed":   True,
+                    "source":      "coinmarketcap.com",
                 })
             except Exception:
                 continue
@@ -169,12 +181,12 @@ def main():
 
     new_count = 0
     for airdrop in all_airdrops:
-        if airdrop["rating"] < MIN_RATING:
+        if airdrop["temperature"] < MIN_TEMP:
             continue
         if airdrop["id"] not in seen:
             seen.add(airdrop["id"])
             send_telegram(format_alert(airdrop))
-            print(f"[NEW] {airdrop['name']} ({airdrop['source']})")
+            print(f"[NEW] {airdrop['name']} | temp={airdrop['temperature']} | {airdrop['source']}")
             new_count += 1
             time.sleep(1)
 
